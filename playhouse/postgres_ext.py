@@ -3,6 +3,7 @@ Collection of postgres-specific extensions, currently including:
 
 * Support for hstore, a key/value type storage
 """
+import json
 import logging
 import uuid
 
@@ -149,6 +150,7 @@ class IndexedFieldMixin(object):
 
 class ArrayField(IndexedFieldMixin, Field):
     passthrough = True
+    unpack = False
 
     def __init__(self, field_class=IntegerField, field_kwargs=None,
                  dimensions=1, convert_values=False, *args, **kwargs):
@@ -232,6 +234,7 @@ class DateTimeTZField(DateTimeField):
 
 class HStoreField(IndexedFieldMixin, Field):
     field_type = 'HSTORE'
+    unpack = False
     __hash__ = Field.__hash__
 
     def __getitem__(self, key):
@@ -277,18 +280,20 @@ class HStoreField(IndexedFieldMixin, Field):
 
 class JSONField(Field):
     field_type = 'JSON'
+    unpack = False
+    _json_datatype = 'json'
 
     def __init__(self, dumps=None, *args, **kwargs):
         if Json is None:
             raise Exception('Your version of psycopg2 does not support JSON.')
-        self.dumps = dumps
+        self.dumps = dumps or json.dumps
         super(JSONField, self).__init__(*args, **kwargs)
 
     def db_value(self, value):
         if value is None:
             return value
         if not isinstance(value, Json):
-            return Json(value, dumps=self.dumps)
+            return Cast(self.dumps(value), self._json_datatype)
         return value
 
     def __getitem__(self, value):
@@ -307,6 +312,7 @@ def cast_jsonb(node):
 
 class BinaryJSONField(IndexedFieldMixin, JSONField):
     field_type = 'JSONB'
+    _json_datatype = 'jsonb'
     __hash__ = Field.__hash__
 
     def contains(self, other):
@@ -449,7 +455,10 @@ class PostgresqlExtDatabase(PostgresqlDatabase):
 
     def cursor(self, commit=None):
         if self.is_closed():
-            self.connect()
+            if self.autoconnect:
+                self.connect()
+            else:
+                raise InterfaceError('Error, database connection not opened.')
         if commit is __named_cursor__:
             return self._state.conn.cursor(name=str(uuid.uuid1()))
         return self._state.conn.cursor()

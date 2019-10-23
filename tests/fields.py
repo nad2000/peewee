@@ -250,6 +250,35 @@ class TestDateFields(ModelTestCase):
                 2011., 1., 2., 11., 12., 13.054321, 2012., 2., 3., 3., 13.,
                 37.))
 
+    def test_truncate_date(self):
+        dm = DateModel.create(
+            date_time=datetime.datetime(2001, 2, 3, 4, 5, 6, 7),
+            date=datetime.date(2002, 3, 4))
+
+        accum = []
+        for p in ('year', 'month', 'day', 'hour', 'minute', 'second'):
+            accum.append(DateModel.date_time.truncate(p))
+        for p in ('year', 'month', 'day'):
+            accum.append(DateModel.date.truncate(p))
+
+        query = DateModel.select(*accum).tuples()
+        data = list(query[0])
+
+        # Postgres includes timezone info, so strip that for comparison.
+        if IS_POSTGRESQL:
+            data = [dt.replace(tzinfo=None) for dt in data]
+
+        self.assertEqual(data, [
+            datetime.datetime(2001, 1, 1, 0, 0, 0),
+            datetime.datetime(2001, 2, 1, 0, 0, 0),
+            datetime.datetime(2001, 2, 3, 0, 0, 0),
+            datetime.datetime(2001, 2, 3, 4, 0, 0),
+            datetime.datetime(2001, 2, 3, 4, 5, 0),
+            datetime.datetime(2001, 2, 3, 4, 5, 6),
+            datetime.datetime(2002, 1, 1, 0, 0, 0),
+            datetime.datetime(2002, 3, 1, 0, 0, 0),
+            datetime.datetime(2002, 3, 4, 0, 0, 0)])
+
     def test_to_timestamp(self):
         dt = datetime.datetime(2019, 1, 2, 3, 4, 5)
         ts = calendar.timegm(dt.utctimetuple())
@@ -865,6 +894,41 @@ class TestUUIDField(ModelTestCase):
         self.assertEqual(u_db.bdata, uu)
 
 
+class UU1(TestModel):
+    id = UUIDField(default=uuid.uuid4, primary_key=True)
+    name = TextField()
+
+class UU2(TestModel):
+    id = UUIDField(default=uuid.uuid4, primary_key=True)
+    u1 = ForeignKeyField(UU1)
+    name = TextField()
+
+
+class TestForeignKeyUUIDField(ModelTestCase):
+    requires = [UU1, UU2]
+
+    def test_bulk_insert(self):
+        # Create three UU1 instances.
+        UU1.insert_many([{UU1.name: name} for name in 'abc'],
+                       fields=[UU1.id, UU1.name]).execute()
+        ua, ub, uc = UU1.select().order_by(UU1.name)
+
+        # Create several UU2 instances.
+        data = (
+            ('a1', ua),
+            ('b1', ub),
+            ('b2', ub),
+            ('c1', uc))
+        iq = UU2.insert_many([{UU2.name: name, UU2.u1: u} for name, u in data],
+                             fields=[UU2.id, UU2.name, UU2.u1])
+        iq.execute()
+
+        query = UU2.select().order_by(UU2.name)
+        for (name, u1), u2 in zip(data, query):
+            self.assertEqual(u2.name, name)
+            self.assertEqual(u2.u1.id, u1.id)
+
+
 class TSModel(TestModel):
     ts_s = TimestampField()
     ts_us = TimestampField(resolution=10 ** 6)
@@ -872,8 +936,27 @@ class TSModel(TestModel):
     ts_u = TimestampField(null=True, utc=True)
 
 
+class TSR(TestModel):
+    ts_0 = TimestampField(resolution=0)
+    ts_1 = TimestampField(resolution=1)
+    ts_10 = TimestampField(resolution=10)
+    ts_2 = TimestampField(resolution=2)
+
+
 class TestTimestampField(ModelTestCase):
     requires = [TSModel]
+
+    @requires_models(TSR)
+    def test_timestamp_field_resolutions(self):
+        dt = datetime.datetime(2018, 3, 1, 3, 3, 7).replace(microsecond=123456)
+        ts = TSR.create(ts_0=dt, ts_1=dt, ts_10=dt, ts_2=dt)
+        ts_db = TSR[ts.id]
+
+        # Zero and one are both treated as "seconds" resolution.
+        self.assertEqual(ts_db.ts_0, dt.replace(microsecond=0))
+        self.assertEqual(ts_db.ts_1, dt.replace(microsecond=0))
+        self.assertEqual(ts_db.ts_10, dt.replace(microsecond=100000))
+        self.assertEqual(ts_db.ts_2, dt.replace(microsecond=120000))
 
     def test_timestamp_field(self):
         dt = datetime.datetime(2018, 3, 1, 3, 3, 7)
@@ -1218,3 +1301,61 @@ class TestForeignKeyLazyLoad(ModelTestCase):
             self.assertEqual(bi.nq_lazy.name, 'b')
             self.assertTrue(bi.nq_null is None)
             self.assertTrue(bi.nq_lazy_null is None)
+
+
+class SM(TestModel):
+    text_field = TextField()
+    char_field = CharField()
+
+
+class TestStringFields(ModelTestCase):
+    requires = [SM]
+
+    def test_string_fields(self):
+        bdata = b'b1'
+        udata = b'u1'.decode('utf8')
+
+        sb = SM.create(text_field=bdata, char_field=bdata)
+        su = SM.create(text_field=udata, char_field=udata)
+
+        sb_db = SM.get(SM.id == sb.id)
+        self.assertEqual(sb_db.text_field, 'b1')
+        self.assertEqual(sb_db.char_field, 'b1')
+
+        su_db = SM.get(SM.id == su.id)
+        self.assertEqual(su_db.text_field, 'u1')
+        self.assertEqual(su_db.char_field, 'u1')
+
+        bvals = (b'b1', u'b1')
+        uvals = (b'u1', u'u1')
+
+        for field in (SM.text_field, SM.char_field):
+            for bval in bvals:
+                sb_db = SM.get(field == bval)
+                self.assertEqual(sb.id, sb_db.id)
+
+            for uval in uvals:
+                sb_db = SM.get(field == uval)
+                self.assertEqual(su.id, su_db.id)
+
+
+class InvalidTypes(TestModel):
+    tfield = TextField()
+    ifield = IntegerField()
+    ffield = FloatField()
+
+
+class TestSqliteInvalidDataTypes(ModelTestCase):
+    database = get_in_memory_db()
+    requires = [InvalidTypes]
+
+    def test_invalid_data_types(self):
+        it = InvalidTypes.create(tfield=100, ifield='five', ffield='pi')
+        it_db1 = InvalidTypes.get(InvalidTypes.tfield == 100)
+        it_db2 = InvalidTypes.get(InvalidTypes.ifield == 'five')
+        it_db3 = InvalidTypes.get(InvalidTypes.ffield == 'pi')
+        self.assertTrue(it.id == it_db1.id == it_db2.id == it_db3.id)
+
+        self.assertEqual(it_db1.tfield, '100')
+        self.assertEqual(it_db1.ifield, 'five')
+        self.assertEqual(it_db1.ffield, 'pi')

@@ -323,7 +323,7 @@ class TestReturningIntegrationRegressions(ModelTestCase):
                 .where(Tweet.user == User.id))
         query = (User
                  .update(username=(User.username + '-x'))
-                 .returning(subq, User.username))
+                 .returning(subq.alias('ct'), User.username))
         result = query.execute()
         self.assertEqual(sorted([(r.ct, r.username) for r in result]), [
             (0, 'zaizee-x'), (2, 'mickey-x'), (3, 'huey-x')])
@@ -891,3 +891,110 @@ class TestCompoundExistsRegression(ModelTestCase):
         User.create(username='u1')
         self.assertTrue(cq.exists())
         self.assertEqual(cq.count(), 1)
+
+
+class TestViewFieldMapping(ModelTestCase):
+    requires = [User]
+
+    def tearDown(self):
+        try:
+            self.execute('drop view user_testview_fm')
+        except Exception as exc:
+            pass
+        super(TestViewFieldMapping, self).tearDown()
+
+    def test_view_field_mapping(self):
+        user = User.create(username='huey')
+        self.execute('create view user_testview_fm as '
+                     'select id, username from users')
+
+        class View(User):
+            class Meta:
+                table_name = 'user_testview_fm'
+
+        self.assertEqual([(v.id, v.username) for v in View.select()],
+                         [(user.id, 'huey')])
+
+
+class TC(TestModel):
+    ifield = IntegerField()
+    ffield = FloatField()
+    cfield = TextField()
+    tfield = TextField()
+
+
+class TestTypeCoercion(ModelTestCase):
+    requires = [TC]
+
+    def test_type_coercion(self):
+        t = TC.create(ifield='10', ffield='20.5', cfield=30, tfield=40)
+        t_db = TC.get(TC.id == t.id)
+
+        self.assertEqual(t_db.ifield, 10)
+        self.assertEqual(t_db.ffield, 20.5)
+        self.assertEqual(t_db.cfield, '30')
+        self.assertEqual(t_db.tfield, '40')
+
+
+class TestLikeColumnValue(ModelTestCase):
+    requires = [User, Tweet]
+
+    def test_like_column_value(self):
+        # e.g., find all tweets that contain the users own username.
+        u1, u2, u3 = [User.create(username='u%s' % i) for i in (1, 2, 3)]
+        data = (
+            (u1, ('nada', 'i am u1', 'u1 is my name')),
+            (u2, ('nothing', 'he is u1')),
+            (u3, ('she is u2', 'hey u3 is me', 'xx')))
+        for user, tweets in data:
+            Tweet.insert_many([(user, tweet) for tweet in tweets],
+                              fields=[Tweet.user, Tweet.content]).execute()
+
+        expressions = (
+            (Tweet.content ** ('%' + User.username + '%')),
+            Tweet.content.contains(User.username))
+
+        for expr in expressions:
+            query = (Tweet
+                     .select(Tweet, User)
+                     .join(User)
+                     .where(expr)
+                     .order_by(Tweet.id))
+
+            self.assertEqual([(t.user.username, t.content) for t in query], [
+                ('u1', 'i am u1'),
+                ('u1', 'u1 is my name'),
+                ('u3', 'hey u3 is me')])
+
+
+class TestUnionParenthesesRegression(ModelTestCase):
+    requires = [User]
+
+    def test_union_parentheses_regression(self):
+        ua, ub, uc = [User.create(username=u) for u in 'abc']
+        lhs = User.select(User.id).where(User.username == 'a')
+        rhs = User.select(User.id).where(User.username == 'c')
+        union = lhs.union_all(rhs)
+        self.assertEqual(sorted([u.id for u in union]), [ua.id, uc.id])
+
+        query = User.select().where(User.id.in_(union)).order_by(User.id)
+        self.assertEqual([u.username for u in query], ['a', 'c'])
+
+
+class NoPK(TestModel):
+    data = IntegerField()
+    class Meta:
+        primary_key = False
+
+
+class TestNoPKHashRegression(ModelTestCase):
+    requires = [NoPK]
+
+    def test_no_pk_hash_regression(self):
+        npk = NoPK.create(data=1)
+        npk_db = NoPK.get(NoPK.data == 1)
+        # When a model does not define a primary key, we cannot test equality.
+        self.assertTrue(npk != npk_db)
+
+        # Their hash is the same, though they are not equal.
+        self.assertEqual(hash(npk), hash(npk_db))

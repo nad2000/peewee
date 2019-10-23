@@ -65,7 +65,7 @@ except ImportError:
         mysql = None
 
 
-__version__ = '3.9.6'
+__version__ = '3.11.2'
 __all__ = [
     'AsIs',
     'AutoField',
@@ -206,15 +206,15 @@ __sqlite_datetime_formats__ = (
     '%H:%M')
 
 __sqlite_date_trunc__ = {
-    'year': '%Y',
-    'month': '%Y-%m',
-    'day': '%Y-%m-%d',
-    'hour': '%Y-%m-%d %H',
-    'minute': '%Y-%m-%d %H:%M',
+    'year': '%Y-01-01 00:00:00',
+    'month': '%Y-%m-01 00:00:00',
+    'day': '%Y-%m-%d 00:00:00',
+    'hour': '%Y-%m-%d %H:00:00',
+    'minute': '%Y-%m-%d %H:%M:00',
     'second': '%Y-%m-%d %H:%M:%S'}
 
 __mysql_date_trunc__ = __sqlite_date_trunc__.copy()
-__mysql_date_trunc__['minute'] = '%Y-%m-%d %H:%i'
+__mysql_date_trunc__['minute'] = '%Y-%m-%d %H:%i:00'
 __mysql_date_trunc__['second'] = '%Y-%m-%d %H:%i:%S'
 
 def _sqlite_date_part(lookup_type, datetime_string):
@@ -458,6 +458,9 @@ class DatabaseProxy(Proxy):
         return _transaction(self)
     def savepoint(self):
         return _savepoint(self)
+
+
+class ModelDescriptor(object): pass
 
 
 # SQL Generation.
@@ -765,8 +768,9 @@ class Source(Node):
     def left_outer_join(self, dest, on=None):
         return Join(self, dest, JOIN.LEFT_OUTER, on)
 
-    def cte(self, name, recursive=False, columns=None):
-        return CTE(name, self, recursive=recursive, columns=columns)
+    def cte(self, name, recursive=False, columns=None, materialized=None):
+        return CTE(name, self, recursive=recursive, columns=columns,
+                   materialized=materialized)
 
     def get_sort_key(self, ctx):
         if self._alias:
@@ -1016,10 +1020,12 @@ class ValuesList(_HashableSource, BaseTable):
 
 
 class CTE(_HashableSource, Source):
-    def __init__(self, name, query, recursive=False, columns=None):
+    def __init__(self, name, query, recursive=False, columns=None,
+                 materialized=None):
         self._alias = name
         self._query = query
         self._recursive = recursive
+        self._materialized = materialized
         if columns is not None:
             columns = [Entity(c) if isinstance(c, basestring) else c
                        for c in columns]
@@ -1060,6 +1066,12 @@ class CTE(_HashableSource, Source):
             if self._columns:
                 ctx.literal(' ').sql(EnclosedNodeList(self._columns))
             ctx.literal(' AS ')
+
+            if self._materialized:
+                ctx.literal('MATERIALIZED ')
+            elif self._materialized is False:
+                ctx.literal('NOT MATERIALIZED ')
+
             with ctx.scope_normal(parentheses=True):
                 ctx.sql(self._query)
         return ctx
@@ -1141,11 +1153,24 @@ class ColumnBase(Node):
         op = OP.IS if is_null else OP.IS_NOT
         return Expression(self, op, None)
     def contains(self, rhs):
-        return Expression(self, OP.ILIKE, '%%%s%%' % rhs)
+        if isinstance(rhs, Node):
+            rhs = Expression('%', OP.CONCAT,
+                             Expression(rhs, OP.CONCAT, '%'))
+        else:
+            rhs = '%%%s%%' % rhs
+        return Expression(self, OP.ILIKE, rhs)
     def startswith(self, rhs):
-        return Expression(self, OP.ILIKE, '%s%%' % rhs)
+        if isinstance(rhs, Node):
+            rhs = Expression(rhs, OP.CONCAT, '%')
+        else:
+            rhs = '%s%%' % rhs
+        return Expression(self, OP.ILIKE, rhs)
     def endswith(self, rhs):
-        return Expression(self, OP.ILIKE, '%%%s' % rhs)
+        if isinstance(rhs, Node):
+            rhs = Expression('%', OP.CONCAT, rhs)
+        else:
+            rhs = '%%%s' % rhs
+        return Expression(self, OP.ILIKE, rhs)
     def between(self, lo, hi):
         return Expression(self, OP.BETWEEN, NodeList((lo, SQL('AND'), hi)))
     def concat(self, rhs):
@@ -1228,6 +1253,9 @@ class Alias(WrappedNode):
     def __init__(self, node, alias):
         super(Alias, self).__init__(node)
         self._alias = alias
+
+    def __hash__(self):
+        return hash(self._alias)
 
     def alias(self, alias=None):
         if alias is None:
@@ -1379,12 +1407,12 @@ class Expression(ColumnBase):
 
         # First attempt to unwrap the node on the left-hand-side, so that we
         # can get at the underlying Field if one is present.
-        node = self.lhs
-        if isinstance(node, WrappedNode):
-            node = node.unwrap()
+        node = raw_node = self.lhs
+        if isinstance(raw_node, WrappedNode):
+            node = raw_node.unwrap()
 
         # Set up the appropriate converter if we have a field on the left side.
-        if isinstance(node, Field):
+        if isinstance(node, Field) and raw_node._coerce:
             overrides['converter'] = node.db_value
         else:
             overrides['converter'] = None
@@ -2114,6 +2142,14 @@ class CompoundSelectQuery(SelectBase):
         elif csq_setting == CSQ_PARENTHESES_ALWAYS:
             return True
         elif csq_setting == CSQ_PARENTHESES_UNNESTED:
+            if ctx.state.in_expr or ctx.state.in_function:
+                # If this compound select query is being used inside an
+                # expression, e.g., an IN or EXISTS().
+                return False
+
+            # If the query on the left or right is itself a compound select
+            # query, then we do not apply parentheses. However, if it is a
+            # regular SELECT query, we will apply parentheses.
             return not isinstance(subq, CompoundSelectQuery)
 
     def __sql__(self, ctx):
@@ -2322,7 +2358,7 @@ class _WriteQuery(Query):
 
     def apply_returning(self, ctx):
         if self._returning:
-            with ctx.scope_normal():
+            with ctx.scope_source():
                 ctx.literal(' RETURNING ').sql(CommaNodeList(self._returning))
         return ctx
 
@@ -2375,8 +2411,10 @@ class Update(_WriteQuery):
             expressions = []
             for k, v in sorted(self._update.items(), key=ctx.column_sort_key):
                 if not isinstance(v, Node):
-                    converter = k.db_value if isinstance(k, Field) else None
-                    v = Value(v, converter=converter, unpack=False)
+                    if isinstance(k, Field):
+                        v = k.to_value(v)
+                    else:
+                        v = Value(v, unpack=False)
                 if not isinstance(v, Value):
                     v = qualify_names(v)
                 expressions.append(NodeList((k, SQL('='), v)))
@@ -2446,7 +2484,6 @@ class Insert(_WriteQuery):
 
         # Load and organize column defaults (if provided).
         defaults = self.get_default_data()
-        value_lookups = {}
 
         # First figure out what columns are being inserted (if they weren't
         # specified explicitly). Resulting columns are normalized and ordered.
@@ -2456,47 +2493,48 @@ class Insert(_WriteQuery):
             except StopIteration:
                 raise self.DefaultValuesException('Error: no rows to insert.')
 
-            if not isinstance(row, dict):
+            if not isinstance(row, Mapping):
                 columns = self.get_default_columns()
                 if columns is None:
                     raise ValueError('Bulk insert must specify columns.')
             else:
                 # Infer column names from the dict of data being inserted.
                 accum = []
-                uses_strings = False  # Are the dict keys strings or columns?
-                for key in row:
-                    if isinstance(key, basestring):
-                        column = getattr(self.table, key)
-                        uses_strings = True
-                    else:
-                        column = key
+                for column in row:
+                    if isinstance(column, basestring):
+                        column = getattr(self.table, column)
                     accum.append(column)
-                    value_lookups[column] = key
 
                 # Add any columns present in the default data that are not
                 # accounted for by the dictionary of row data.
                 column_set = set(accum)
                 for col in (set(defaults) - column_set):
                     accum.append(col)
-                    value_lookups[col] = col.name if uses_strings else col
 
                 columns = sorted(accum, key=lambda obj: obj.get_sort_key(ctx))
             rows_iter = itertools.chain(iter((row,)), rows_iter)
         else:
             clean_columns = []
+            seen = set()
             for column in columns:
                 if isinstance(column, basestring):
                     column_obj = getattr(self.table, column)
                 else:
                     column_obj = column
-                value_lookups[column_obj] = column
                 clean_columns.append(column_obj)
+                seen.add(column_obj)
 
             columns = clean_columns
             for col in sorted(defaults, key=lambda obj: obj.get_sort_key(ctx)):
-                if col not in value_lookups:
+                if col not in seen:
                     columns.append(col)
-                    value_lookups[col] = col
+
+        value_lookups = {}
+        for column in columns:
+            lookups = [column, column.name]
+            if isinstance(column, Field) and column.name != column.column_name:
+                lookups.append(column.column_name)
+            value_lookups[column] = lookups
 
         ctx.sql(EnclosedNodeList(columns)).literal(' VALUES ')
         columns_converters = [
@@ -2510,7 +2548,18 @@ class Insert(_WriteQuery):
             for i, (column, converter) in enumerate(columns_converters):
                 try:
                     if is_dict:
-                        val = row[value_lookups[column]]
+                        # The logic is a bit convoluted, but in order to be
+                        # flexible in what we accept (dict keyed by
+                        # column/field, field name, or underlying column name),
+                        # we try accessing the row data dict using each
+                        # possible key. If no match is found, throw an error.
+                        for lookup in value_lookups[column]:
+                            try:
+                                val = row[lookup]
+                            except KeyError: pass
+                            else: break
+                        else:
+                            raise KeyError
                     else:
                         val = row[i]
                 except (KeyError, IndexError):
@@ -2557,7 +2606,7 @@ class Insert(_WriteQuery):
              .sql(self.table)
              .literal(' '))
 
-            if isinstance(self._insert, dict) and not self._columns:
+            if isinstance(self._insert, Mapping) and not self._columns:
                 try:
                     self._simple_insert(ctx)
                 except self.DefaultValuesException:
@@ -2589,6 +2638,8 @@ class Insert(_WriteQuery):
     def handle_result(self, database, cursor):
         if self._return_cursor:
             return cursor
+        if self._query_type != Insert.SIMPLE and not self._returning:
+            return database.rows_affected(cursor)
         return database.last_insert_id(cursor, self._query_type)
 
 
@@ -2938,6 +2989,9 @@ class Database(_callable_context_manager):
     def is_closed(self):
         return self._state.closed
 
+    def is_connection_usable(self):
+        return not self._state.closed
+
     def connection(self):
         if self.is_closed():
             self.connect()
@@ -3037,8 +3091,10 @@ class Database(_callable_context_manager):
                     # field object, to apply data-type conversions.
                     if isinstance(k, basestring):
                         k = getattr(query.table, k)
-                    converter = k.db_value if isinstance(k, Field) else None
-                    v = Value(v, converter=converter, unpack=False)
+                    if isinstance(k, Field):
+                        v = k.to_value(v)
+                    else:
+                        v = Value(v, unpack=False)
                 else:
                     v = QualifiedNames(v)
                 updates.append(NodeList((ensure_entity(k), SQL('='), v)))
@@ -3215,6 +3271,7 @@ class SqliteDatabase(Database):
         self._attached = {}
         self.register_function(_sqlite_date_part, 'date_part', 2)
         self.register_function(_sqlite_date_trunc, 'date_trunc', 2)
+        self.nulls_ordering = self.server_version >= (3, 30, 0)
 
     def init(self, database, pragmas=None, timeout=5, **kwargs):
         if pragmas is not None:
@@ -3551,10 +3608,11 @@ class SqliteDatabase(Database):
         return self._build_on_conflict_update(oc, query)
 
     def extract_date(self, date_part, date_field):
-        return fn.date_part(date_part, date_field)
+        return fn.date_part(date_part, date_field, python_value=int)
 
     def truncate_date(self, date_part, date_field):
-        return fn.date_trunc(date_part, date_field)
+        return fn.date_trunc(date_part, date_field,
+                             python_value=simple_date_time)
 
     def to_timestamp(self, date_field):
         return fn.strftime('%s', date_field).cast('integer')
@@ -3585,9 +3643,11 @@ class PostgresqlDatabase(Database):
     safe_create_index = False
     sequences = True
 
-    def init(self, database, register_unicode=True, encoding=None, **kwargs):
+    def init(self, database, register_unicode=True, encoding=None,
+             isolation_level=None, **kwargs):
         self._register_unicode = register_unicode
         self._encoding = encoding
+        self._isolation_level = isolation_level
         super(PostgresqlDatabase, self).init(database, **kwargs)
 
     def _connect(self):
@@ -3599,6 +3659,8 @@ class PostgresqlDatabase(Database):
             pg_extensions.register_type(pg_extensions.UNICODEARRAY, conn)
         if self._encoding:
             conn.set_client_encoding(self._encoding)
+        if self._isolation_level:
+            conn.set_isolation_level(self._isolation_level)
         return conn
 
     def _set_server_version(self, conn):
@@ -3606,9 +3668,19 @@ class PostgresqlDatabase(Database):
         if self.server_version >= 90600:
             self.safe_create_index = True
 
+    def is_connection_usable(self):
+        if self._state.closed:
+            return False
+
+        # Returns True if we are idle, running a command, or in an active
+        # connection. If the connection is in an error state or the connection
+        # is otherwise unusable, return False.
+        txn_status = self._state.conn.get_transaction_status()
+        return txn_status < pg_extensions.TRANSACTION_STATUS_INERROR
+
     def last_insert_id(self, cursor, query_type=None):
         try:
-            return cursor if query_type else cursor[0][0]
+            return cursor if query_type != Insert.SIMPLE else cursor[0][0]
         except (IndexError, KeyError, TypeError):
             pass
 
@@ -3767,9 +3839,13 @@ class MySQLDatabase(Database):
     limit_max = 2 ** 64 - 1
     safe_create_index = False
     safe_drop_index = False
+    sql_mode = 'PIPES_AS_CONCAT'
 
     def init(self, database, **kwargs):
-        params = {'charset': 'utf8', 'use_unicode': True}
+        params = {
+            'charset': 'utf8',
+            'sql_mode': self.sql_mode,
+            'use_unicode': True}
         params.update(kwargs)
         if 'password' in params and mysql_passwd:
             params['passwd'] = params.pop('password')
@@ -3904,8 +3980,10 @@ class MySQLDatabase(Database):
                     # field object, to apply data-type conversions.
                     if isinstance(k, basestring):
                         k = getattr(query.table, k)
-                    converter = k.db_value if isinstance(k, Field) else None
-                    v = Value(v, converter=converter, unpack=False)
+                    if isinstance(k, Field):
+                        v = k.to_value(v)
+                    else:
+                        v = Value(v, unpack=False)
                 updates.append(NodeList((ensure_entity(k), SQL('='), v)))
 
         if updates:
@@ -3916,7 +3994,8 @@ class MySQLDatabase(Database):
         return fn.EXTRACT(NodeList((SQL(date_part), SQL('FROM'), date_field)))
 
     def truncate_date(self, date_part, date_field):
-        return fn.DATE_FORMAT(date_field, __mysql_date_trunc__[date_part])
+        return fn.DATE_FORMAT(date_field, __mysql_date_trunc__[date_part],
+                              python_value=simple_date_time)
 
     def to_timestamp(self, date_field):
         return fn.UNIX_TIMESTAMP(date_field)
@@ -4278,6 +4357,7 @@ class Field(ColumnBase):
     auto_increment = False
     default_index_type = None
     field_type = 'DEFAULT'
+    unpack = True
 
     def __init__(self, null=False, index=False, unique=False, column_name=None,
                  default=None, primary_key=False, constraints=None,
@@ -4323,7 +4403,7 @@ class Field(ColumnBase):
 
     def bind(self, model, name, set_attribute=True):
         self.model = model
-        self.name = name
+        self.name = self.safe_name = name
         self.column_name = self.column_name or name
         if set_attribute:
             setattr(model, name, self.accessor_class(model, self, name))
@@ -4341,6 +4421,9 @@ class Field(ColumnBase):
     def python_value(self, value):
         return value if value is None else self.adapt(value)
 
+    def to_value(self, value):
+        return Value(value, self.db_value, self.unpack)
+
     def get_sort_key(self, ctx):
         return self._sort_key
 
@@ -4348,7 +4431,7 @@ class Field(ColumnBase):
         return ctx.sql(self.column)
 
     def get_modifiers(self):
-        return
+        pass
 
     def ddl_datatype(self, ctx):
         if ctx and ctx.state.field_types:
@@ -4386,7 +4469,12 @@ class Field(ColumnBase):
 
 class IntegerField(Field):
     field_type = 'INT'
-    adapt = int
+
+    def adapt(self, value):
+        try:
+            return int(value)
+        except ValueError:
+            return value
 
 
 class BigIntegerField(IntegerField):
@@ -4415,6 +4503,11 @@ class BigAutoField(AutoField):
 class IdentityField(AutoField):
     field_type = 'INT GENERATED BY DEFAULT AS IDENTITY'
 
+    def __init__(self, generate_always=False, **kwargs):
+        if generate_always:
+            self.field_type = 'INT GENERATED ALWAYS AS IDENTITY'
+        super(IdentityField, self).__init__(**kwargs)
+
 
 class PrimaryKeyField(AutoField):
     def __init__(self, *args, **kwargs):
@@ -4426,7 +4519,12 @@ class PrimaryKeyField(AutoField):
 
 class FloatField(Field):
     field_type = 'FLOAT'
-    adapt = float
+
+    def adapt(self, value):
+        try:
+            return float(value)
+        except ValueError:
+            return value
 
 
 class DoubleField(FloatField):
@@ -4442,6 +4540,7 @@ class DecimalField(Field):
         self.decimal_places = decimal_places
         self.auto_round = auto_round
         self.rounding = rounding or decimal.DefaultContext.rounding
+        self._exp = decimal.Decimal(10) ** (-self.decimal_places)
         super(DecimalField, self).__init__(*args, **kwargs)
 
     def get_modifiers(self):
@@ -4452,9 +4551,8 @@ class DecimalField(Field):
         if not value:
             return value if value is None else D(0)
         if self.auto_round:
-            exp = D(10) ** (-self.decimal_places)
-            rounding = self.rounding
-            return D(text_type(value)).quantize(exp, rounding=rounding)
+            decimal_value = D(text_type(value))
+            return decimal_value.quantize(self._exp, rounding=self.rounding)
         return value
 
     def python_value(self, value):
@@ -4701,6 +4799,12 @@ def format_date_time(value, formats, post_process=None):
             pass
     return value
 
+def simple_date_time(value):
+    try:
+        return datetime.datetime.strptime(value, '%Y-%m-%d %H:%M:%S')
+    except (TypeError, ValueError):
+        return value
+
 
 class _BaseFormattedField(Field):
     formats = None
@@ -4726,6 +4830,9 @@ class DateTimeField(_BaseFormattedField):
 
     def to_timestamp(self):
         return self.model._meta.database.to_timestamp(self)
+
+    def truncate(self, part):
+        return self.model._meta.database.truncate_date(part, self)
 
     year = property(_date_part('year'))
     month = property(_date_part('month'))
@@ -4753,6 +4860,9 @@ class DateField(_BaseFormattedField):
 
     def to_timestamp(self):
         return self.model._meta.database.to_timestamp(self)
+
+    def truncate(self, part):
+        return self.model._meta.database.truncate_date(part, self)
 
     year = property(_date_part('year'))
     month = property(_date_part('month'))
@@ -4800,9 +4910,10 @@ class TimestampField(BigIntegerField):
 
     def __init__(self, *args, **kwargs):
         self.resolution = kwargs.pop('resolution', None)
+
         if not self.resolution:
             self.resolution = 1
-        elif self.resolution in range(7):
+        elif self.resolution in range(2, 7):
             self.resolution = 10 ** self.resolution
         elif self.resolution not in self.valid_resolutions:
             raise ValueError('TimestampField resolution must be one of: %s' %
@@ -4938,6 +5049,7 @@ class ForeignKeyField(Field):
                            '"backref" for Field objects.')
             backref = related_name
 
+        self._is_self_reference = model == 'self'
         self.rel_model = model
         self.rel_field = field
         self.declared_backref = backref
@@ -4986,7 +5098,7 @@ class ForeignKeyField(Field):
             raise ValueError('ForeignKeyField "%s"."%s" specifies an '
                              'object_id_name that conflicts with its field '
                              'name.' % (model._meta.name, name))
-        if self.rel_model == 'self':
+        if self._is_self_reference:
             self.rel_model = model
         if isinstance(self.rel_field, basestring):
             self.rel_field = getattr(self.rel_model, self.rel_field)
@@ -4996,6 +5108,7 @@ class ForeignKeyField(Field):
         # Bind field before assigning backref, so field is bound when
         # calling declared_backref() (if callable).
         super(ForeignKeyField, self).bind(model, name, set_attribute)
+        self.safe_name = self.object_id_name
 
         if callable_(self.declared_backref):
             self.backref = self.declared_backref(self)
@@ -5221,7 +5334,7 @@ class VirtualField(MetaField):
 
     def bind(self, model, name, set_attribute=True):
         self.model = model
-        self.column_name = self.name = name
+        self.column_name = self.name = self.safe_name = name
         setattr(model, name, self.accessor_class(model, self, name))
 
 
@@ -5268,7 +5381,7 @@ class CompositeKey(MetaField):
 
     def bind(self, model, name, set_attribute=True):
         self.model = model
-        self.column_name = self.name = name
+        self.column_name = self.name = self.safe_name = name
         setattr(model, self.name, self)
 
 
@@ -6101,18 +6214,22 @@ class Model(with_metaclass(ModelBase, Node)):
         if cls._meta.auto_increment:
             pk_name = cls._meta.primary_key.name
             field_names.remove(pk_name)
-            ids_returned = cls._meta.database.returning_clause
+
+        if cls._meta.database.returning_clause and \
+           cls._meta.primary_key is not False:
+            pk_fields = cls._meta.get_primary_keys()
         else:
-            ids_returned = False
+            pk_fields = None
 
         fields = [cls._meta.fields[field_name] for field_name in field_names]
         for batch in batches:
             accum = ([getattr(model, f) for f in field_names]
                      for model in batch)
             res = cls.insert_many(accum, fields=fields).execute()
-            if ids_returned and res is not None:
-                for (obj_id,), model in zip(res, batch):
-                    setattr(model, pk_name, obj_id)
+            if pk_fields and res is not None:
+                for row, model in zip(res, batch):
+                    for (pk_field, obj_id) in zip(pk_fields, row):
+                        setattr(model, pk_field.name, obj_id)
 
     @classmethod
     def bulk_update(cls, model_list, fields, batch_size=None):
@@ -6141,7 +6258,7 @@ class Model(with_metaclass(ModelBase, Node)):
                 for model in batch:
                     value = getattr(model, attr)
                     if not isinstance(value, Node):
-                        value = Value(value, converter=field.db_value)
+                        value = field.to_value(value)
                     accum.append((model._pk, value))
                 case = Case(cls._meta.primary_key, accum)
                 update[field] = case
@@ -6217,7 +6334,12 @@ class Model(with_metaclass(ModelBase, Node)):
         return cls.select().filter(*dq_nodes, **filters)
 
     def get_id(self):
-        return getattr(self, self._meta.primary_key.name)
+        # Using getattr(self, pk-name) could accidentally trigger a query if
+        # the primary-key is a foreign-key. So we use the safe_name attribute,
+        # which defaults to the field-name, but will be the object_id_name for
+        # foreign-key fields.
+        if self._meta.primary_key is not False:
+            return getattr(self, self._meta.primary_key.safe_name)
 
     _pk = property(get_id)
 
@@ -6332,13 +6454,14 @@ class Model(with_metaclass(ModelBase, Node)):
         return (
             other.__class__ == self.__class__ and
             self._pk is not None and
-            other._pk == self._pk)
+            self._pk == other._pk)
 
     def __ne__(self, other):
         return not self == other
 
     def __sql__(self, ctx):
-        return ctx.sql(getattr(self, self._meta.primary_key.name))
+        return ctx.sql(Value(getattr(self, self._meta.primary_key.name),
+                             converter=self._meta.primary_key.db_value))
 
     @classmethod
     def bind(cls, database, bind_refs=True, bind_backrefs=True):
@@ -6405,6 +6528,18 @@ class ModelAlias(Node):
         self.__dict__['alias'] = alias
 
     def __getattr__(self, attr):
+        # Hack to work-around the fact that properties or other objects
+        # implementing the descriptor protocol (on the model being aliased),
+        # will not work correctly when we use getattr(). So we explicitly pass
+        # the model alias to the descriptor's getter.
+        try:
+            obj = self.model.__dict__[attr]
+        except KeyError:
+            pass
+        else:
+            if isinstance(obj, ModelDescriptor):
+                return obj.__get__(None, self)
+
         model_attr = getattr(self.model, attr)
         if isinstance(model_attr, Field):
             self.__dict__[attr] = FieldAlias.create(self, model_attr)
@@ -6792,7 +6927,7 @@ class ModelSelect(BaseModelSelect, Select):
             on, attr, constructor = self._normalize_join(src, dest, on, attr)
             if attr:
                 self._joins.setdefault(src, [])
-                self._joins[src].append((dest, attr, constructor))
+                self._joins[src].append((dest, attr, constructor, join_type))
         elif on is not None:
             raise ValueError('Cannot specify on clause with cross join.')
 
@@ -6814,7 +6949,7 @@ class ModelSelect(BaseModelSelect, Select):
 
     def ensure_join(self, lm, rm, on=None, **join_kwargs):
         join_ctx = self._join_ctx
-        for dest, attr, constructor in self._joins.get(lm, []):
+        for dest, _, constructor, _ in self._joins.get(lm, []):
             if dest == rm:
                 return self
         return self.switch(lm).join(rm, on=on, **join_kwargs).switch(join_ctx)
@@ -6839,7 +6974,7 @@ class ModelSelect(BaseModelSelect, Select):
                 model_attr = getattr(curr, key)
             else:
                 for piece in key.split('__'):
-                    for dest, attr, _ in self._joins.get(curr, ()):
+                    for dest, attr, _, _ in self._joins.get(curr, ()):
                         if attr == piece or (isinstance(dest, ModelAlias) and
                                              dest.alias == piece):
                             curr = dest
@@ -7081,8 +7216,7 @@ class BaseModelCursorWrapper(DictCursorWrapper):
                 if raw_node._coerce:
                     converters[idx] = node.python_value
                 fields[idx] = node
-                if (column == node.name or column == node.column_name) and \
-                   not raw_node.is_alias():
+                if not raw_node.is_alias():
                     self.columns[idx] = node.name
             elif isinstance(node, Function) and node._coerce:
                 if node._python_value is not None:
@@ -7182,6 +7316,7 @@ class ModelCursorWrapper(BaseModelCursorWrapper):
         self.src_to_dest = []
         accum = collections.deque(self.from_list)
         dests = set()
+
         while accum:
             curr = accum.popleft()
             if isinstance(curr, Join):
@@ -7192,11 +7327,14 @@ class ModelCursorWrapper(BaseModelCursorWrapper):
             if curr not in self.joins:
                 continue
 
-            for key, attr, constructor in self.joins[curr]:
+            is_dict = isinstance(curr, dict)
+            for key, attr, constructor, join_type in self.joins[curr]:
                 if key not in self.key_to_constructor:
                     self.key_to_constructor[key] = constructor
-                    self.src_to_dest.append((curr, attr, key,
-                                             isinstance(curr, dict)))
+
+                    # (src, attr, dest, is_dict, join_type).
+                    self.src_to_dest.append((curr, attr, key, is_dict,
+                                             join_type))
                     dests.add(key)
                     accum.append(key)
 
@@ -7209,7 +7347,7 @@ class ModelCursorWrapper(BaseModelCursorWrapper):
                     self.key_to_constructor[src] = src.model
 
         # Indicate which sources are also dests.
-        for src, _, dest, _ in self.src_to_dest:
+        for src, _, dest, _, _ in self.src_to_dest:
             self.src_is_dest[src] = src in dests and (dest in selected_src
                                                       or src in selected_src)
 
@@ -7253,7 +7391,7 @@ class ModelCursorWrapper(BaseModelCursorWrapper):
                 setattr(instance, column, value)
 
         # Need to do some analysis on the joins before this.
-        for (src, attr, dest, is_dict) in self.src_to_dest:
+        for (src, attr, dest, is_dict, join_type) in self.src_to_dest:
             instance = objects[src]
             try:
                 joined_instance = objects[dest]
@@ -7264,6 +7402,12 @@ class ModelCursorWrapper(BaseModelCursorWrapper):
             # assign an "empty" instance.
             if instance is None or dest is None or \
                (dest not in set_keys and not self.src_is_dest.get(dest)):
+                continue
+
+            # If no fields were set on either the source or the destination,
+            # then we have nothing to do here.
+            if instance not in set_keys and dest not in set_keys \
+               and join_type.endswith('OUTER'):
                 continue
 
             if is_dict:
@@ -7391,7 +7535,7 @@ def prefetch(sq, *subqueries):
                 rel_map.setdefault(rel_model, [])
                 rel_map[rel_model].append(pq)
 
-        deps[query_model] = {}
+        deps.setdefault(query_model, {})
         id_map = deps[query_model]
         has_relations = bool(rel_map.get(query_model))
 

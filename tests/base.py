@@ -85,6 +85,7 @@ IS_SQLITE_OLD = IS_SQLITE and sqlite3.sqlite_version_info < (3, 18)
 IS_SQLITE_15 = IS_SQLITE and sqlite3.sqlite_version_info >= (3, 15)
 IS_SQLITE_24 = IS_SQLITE and sqlite3.sqlite_version_info >= (3, 24)
 IS_SQLITE_25 = IS_SQLITE and sqlite3.sqlite_version_info >= (3, 25)
+IS_SQLITE_30 = IS_SQLITE and sqlite3.sqlite_version_info >= (3, 30)
 IS_SQLITE_9 = IS_SQLITE and sqlite3.sqlite_version_info >= (3, 9)
 IS_MYSQL_ADVANCED_FEATURES = False
 IS_MYSQL_JSON = False
@@ -221,6 +222,8 @@ class ModelTestCase(ModelDatabaseTestCase):
 
     def tearDown(self):
         # Restore the model's previous database object.
+        if not self.database.is_closed():
+            self.database.rollback()
         try:
             if self.requires:
                 self.database.drop_tables(self.requires, safe=True)

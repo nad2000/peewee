@@ -7,10 +7,116 @@ https://github.com/coleifer/peewee/releases
 
 ## master
 
+* Bulk insert (`insert_many()` and `insert_from()`) will now return the row
+  count instead of the last insert ID. If you are using Postgres, peewee will
+  continue to return a cursor that provides an iterator over the newly-inserted
+  primary-key values by default. This behavior is being retained by default for
+  compatibility. Postgres users can simply specify an empty `returning()` call
+  to disable the cursor and retrieve the rowcount instead.
+* Migration extension now supports altering a column's data-type.
+
+[View commits](https://github.com/coleifer/peewee/compare/3.11.2...master)
+
+## 3.11.2
+
+* Implement `hash` interface for `Alias` instances, allowing them to be used in
+  multi-source queries.
+
+[View commits](https://github.com/coleifer/peewee/compare/3.11.1...3.11.2)
+
+## 3.11.1
+
+* Fix bug in new `_pk` / `get_id()` implementation for models that explicitly
+  have disabled a primary-key.
+
+[View commits](https://github.com/coleifer/peewee/compare/3.11.0...3.11.1)
+
+## 3.11.0
+
+* Fixes #1991. This particular issue involves joining 3 models together in a
+  chain, where the outer two models are empty. Previously peewee would make the
+  middle model an empty model instance (since a link might be needed from the
+  source model to the outermost model). But since both were empty, it is more
+  correct to make the intervening model a NULL value on the foreign-key field
+  rather than an empty instance.
+* An unrelated fix came out of the work on #1991 where hashing a model whose
+  primary-key happened to be a foreign-key could trigger the FK resolution
+  query. This patch fixes the `Model._pk` and `get_id()` interfaces so they
+  no longer introduce the possibility of accidentally resolving the FK.
+* Allow `Field.contains()`, `startswith()` and `endswith()` to compare against
+  another column-like object or expression.
+* Workaround for MySQL prior to 8 and MariaDB handling of union queries inside
+  of parenthesized expressions (like IN).
+* Be more permissive in letting invalid values be stored in a field whose type
+  is INTEGER or REAL, since Sqlite allows this.
+* `TimestampField` resolution cleanup. Now values 0 *and* 1 will resolve to a
+  timestamp resolution of 1 second. Values 2-6 specify the number of decimal
+  places (hundredths to microsecond), or alternatively the resolution can still
+  be provided as a power of 10, e.g. 10, 1000 (millisecond), 1e6 (microsecond).
+* When self-referential foreign-keys are inherited, the foreign-key on the
+  subclass will also be self-referential (rather than pointing to the parent
+  model).
+* Add TSV import/export option to the `dataset` extension.
+* Add item interface to the `dataset.Table` class for doing primary-key lookup,
+  assignment, or deletion.
+* Extend the mysql `ReconnectMixin` helper to work with mysql-connector.
+* Fix mapping of double-precision float in postgres schema reflection.
+  Previously it mapped to single-precision, now it correctly uses a double.
+* Fix issue where `PostgresqlExtDatabase` and `MySQLConnectorDatabase` did not
+  respect the `autoconnect` setting.
+
+[View commits](https://github.com/coleifer/peewee/compare/3.10.0...3.11.0)
+
+## 3.10.0
+
 * Add a helper to `playhouse.mysql_ext` for creating `Match` full-text search
   expressions.
+* Added date-part properties to `TimestampField` for accessing the year, month,
+  day, etc., within a SQL expression.
+* Added `to_timestamp()` helper for `DateField` and `DateTimeField` that
+  produces an expression returning a unix timestamp.
+* Add `autoconnect` parameter to `Database` classes. This parameter defaults to
+  `True` and is compatible with previous versions of Peewee, in which executing
+  a query on a closed database would open a connection automatically. To make
+  it easier to catch inconsistent use of the database connection, this behavior
+  can now be disabled by specifying `autoconnect=False`, making an explicit
+  call to `Database.connect()` needed before executing a query.
+* Added database-agnostic interface for obtaining a random value.
+* Allow `isolation_level` to be specified when initializing a Postgres db.
+* Allow hybrid properties to be used on model aliases. Refs #1969.
+* Support aggregates with FILTER predicates on the latest Sqlite.
 
-[View commits](https://github.com/coleifer/peewee/compare/3.9.6...master)
+#### Changes
+
+* More aggressively slot row values into the appropriate field when building
+  objects from the database cursor (rather than using whatever
+  `cursor.description` tells us, which is buggy in older Sqlite).
+* Be more permissive in what we accept in the `insert_many()` and `insert()`
+  methods.
+* When implicitly joining a model with multiple foreign-keys, choose the
+  foreign-key whose name matches that of the related model. Previously, this
+  would have raised a `ValueError` stating that multiple FKs existed.
+* Improved date truncation logic for Sqlite and MySQL to make more compatible
+  with Postgres' `date_trunc()` behavior. Previously, truncating a datetime to
+  month resolution would return `'2019-08'` for example. As of 3.10.0, the
+  Sqlite and MySQL `date_trunc` implementation returns a full datetime, e.g.
+  `'2019-08-01 00:00:00'`.
+* Apply slightly different logic for casting JSON values with Postgres.
+  Previously, Peewee just wrapped the value in the psycopg2 `Json()` helper.
+  In this version, Peewee now dumps the json to a string and applies an
+  explicit cast to the underlying JSON data-type (e.g. json or jsonb).
+
+#### Bug fixes
+
+* Save hooks can now be called for models without a primary key.
+* Fixed bug in the conversion of Python values to JSON when using Postgres.
+* Fix for differentiating empty values from NULL values in `model_to_dict`.
+* Fixed a bug referencing primary-key values that required some kind of
+  conversion (e.g., a UUID). See #1979 for details.
+* Add small jitter to the pool connection timestamp to avoid issues when
+  multiple connections are checked-out at the same exact time.
+
+[View commits](https://github.com/coleifer/peewee/compare/3.9.6...3.10.0)
 
 ## 3.9.6
 
